@@ -187,7 +187,7 @@ SELECT hash, hits, first_path FROM hashes ORDER BY hits DESC LIMIT 10;
 
 ```bash
 pip install -r requirements.txt
-python test_dedup.py        # 28 项断言，真实 HTTP 下载，非 mock
+python test_dedup.py        # 32 项断言，真实 HTTP 下载，非 mock
 ```
 
 测试覆盖：同群重复判重、跨群硬链接（inode 相等）、窗口上限淘汰、延迟守卫、索引 v1→v2 迁移、meta 与表结构不一致的中间态、`--config`/`--check-config` CLI。
