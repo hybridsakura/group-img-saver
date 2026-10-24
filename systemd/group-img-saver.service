@@ -1,0 +1,16 @@
+[Unit]
+Description=group-img-saver — OneBot group image archiver
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/group-img-saver
+Environment=GIS_CONFIG=/opt/group-img-saver/config.json
+Environment=LANG=C.UTF-8
+ExecStart=/opt/group-img-saver/.venv/bin/python /opt/group-img-saver/group_img_saver_svc.py
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

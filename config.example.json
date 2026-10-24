@@ -1,0 +1,16 @@
+{
+  "onebot_ws": "ws://127.0.0.1:6700/",
+  "access_token": "",
+  "watch_groups": ["123456789", "987654321"],
+  "save_root": "./images",
+  "backfill_limit": 2000,
+  "log_level": "INFO",
+  "dedup_enabled": true,
+  "hash_algo": "xxh3_128",
+  "hash_db_path": "./hash_index.db",
+  "max_entries": 200000,
+  "latency_budget_ms": 1000,
+  "hardlink_across_groups": true,
+  "reindex_on_start": true,
+  "record_duplicates": true
+}
