@@ -221,6 +221,33 @@ async def main():
     n_dup = st5.conn.execute("SELECT COUNT(*) FROM duplicates").fetchone()[0]
     check("T11 台账总数仍为 1", n_dup == 1, f"duplicates={n_dup}")
 
+    # T12 fail-closed：xxhash 缺失时必须拒绝启动，而不是静默回退重建索引
+    algo, err = svc.resolve_hash_algo({"hash_algo": "xxh3_128"}, None)
+    check("T12 缺 xxhash 时 algo=None（拒绝启动）", algo is None and err, f"algo={algo}")
+    algo2, err2 = svc.resolve_hash_algo(
+        {"hash_algo": "xxh3_128", "allow_algo_fallback": True}, None)
+    check("T12 显式允许时才回退 sha1", algo2 == "sha1" and err2, f"algo={algo2}")
+    algo3, err3 = svc.resolve_hash_algo({"hash_algo": "bogus"}, svc.xxhash)
+    check("T12 未知算法被拒", algo3 is None and err3, f"algo={algo3}")
+    algo4, err4 = svc.resolve_hash_algo({"hash_algo": "xxh3_128"}, svc.xxhash)
+    check("T12 xxhash 可用时正常", algo4 == "xxh3_128" and err4 is None, f"algo={algo4}")
+
+    # T13 重建索引前必须留备份
+    bakdb = ROOT / "h_bak.db"
+    tmp_store = svc.HashStore(str(bakdb), 1000, 1000)
+    tmp_store.put("00ff", 1, "/tmp/x")
+    tmp_store.close()
+    import sqlite3 as _s3
+    con = _s3.connect(str(bakdb))
+    con.execute("UPDATE meta SET value='sha1' WHERE key='algo'")
+    con.commit()
+    con.close()
+    rebuilt = svc.HashStore(str(bakdb), 1000, 1000)
+    baks = list(ROOT.glob("h_bak.db.bak.sha1.*"))
+    check("T13 重建前生成了备份文件", len(baks) == 1, f"baks={[b.name for b in baks]}")
+    check("T13 重建后索引已清空", rebuilt.count() == 0, f"count={rebuilt.count()}")
+    rebuilt.close()
+
 
 asyncio.run(main())
 fails = [r for r in results if not r[1]]

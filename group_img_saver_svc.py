@@ -84,6 +84,9 @@ DEFAULT_CONFIG = {
     "reindex_on_start": True,
     # 记录被跳过的重复副本（不删除文件，仅入库备用）
     "record_duplicates": True,
+    # xxhash 缺失时是否允许静默回退 sha1。默认 false（fail-closed）：
+    # 回退会触发索引迁移重建，运行时台账不可恢复。
+    "allow_algo_fallback": False,
 }
 # =====================================================
 
@@ -98,14 +101,37 @@ def load_config() -> dict:
     return cfg
 
 
+def resolve_hash_algo(cfg: dict, xxhash_mod) -> tuple[str | None, str | None]:
+    """决定实际使用的哈希算法。
+
+    返回 (algo, error)。error 非空表示必须中止启动（fail-closed）：
+    xxhash 缺失时若静默回退 sha1，会触发索引迁移重建（DROP 表），
+    运行时台账（live/link）无法从磁盘重建 → 数据丢失。
+    """
+    algo = str(cfg.get("hash_algo", "xxh3_128"))
+    if algo not in ("xxh3_128", "xxh64", "sha1"):
+        return (None, f"未知 hash_algo: {algo}（可选 xxh3_128 / xxh64 / sha1）")
+    if algo.startswith("xxh") and xxhash_mod is None:
+        if cfg.get("allow_algo_fallback", False):
+            return ("sha1", f"xxhash 未安装，按 allow_algo_fallback=true 回退 sha1")
+        return (None, (
+            f"hash_algo={algo} 需要 xxhash 模块但当前环境未安装。\n"
+            f"  已中止启动以避免索引被重建（会丢失 duplicates 台账）。\n"
+            f"  处理：pip install xxhash（推荐），"
+            f"或显式设置 allow_algo_fallback=true 接受回退 sha1 并重建索引。"))
+    return (algo, None)
+
+
 CFG = load_config()
 WATCH = {str(g).strip() for g in CFG.get("watch_groups", []) if str(g).strip()}
 SAVE_ROOT = Path(CFG["save_root"])
 LOG_LEVEL = str(CFG.get("log_level", "INFO")).upper()
-HASH_ALGO = str(CFG.get("hash_algo", "xxh3_128"))
-if HASH_ALGO.startswith("xxh") and xxhash is None:
-    print("[warn] xxhash 未安装，回退 sha1", file=sys.stderr)
-    HASH_ALGO = "sha1"
+HASH_ALGO, _algo_err = resolve_hash_algo(CFG, xxhash)
+if HASH_ALGO is None:
+    print(f"[ERROR] {_algo_err}", file=sys.stderr, flush=True)
+    sys.exit(2)
+if _algo_err:
+    print(f"[warn] {_algo_err}", file=sys.stderr, flush=True)
 
 
 def log(level: str, msg: str) -> None:
@@ -211,7 +237,16 @@ class HashStore:
         stale = (ver != self.SCHEMA_VERSION or old_algo != HASH_ALGO or cols_bad)
         if stale and exists:
             log("WARN", f"索引重建：schema={ver}/{old_algo} 列={'v1' if cols_bad else 'ok'}"
-                        f" → {self.SCHEMA_VERSION}/{HASH_ALGO}，旧索引作废，将按新算法重算")
+                        f" → {self.SCHEMA_VERSION}/{HASH_ALGO}，旧索引将重建")
+            # 重建前留一份快照：运行时台账（live/link）无法从磁盘重建，只能靠这份备份找回
+            try:
+                import shutil
+                bak = f"{self.path}.bak.{old_algo or 'v1'}.{time.strftime('%Y%m%d-%H%M%S')}"
+                self.conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+                shutil.copy2(self.path, bak)
+                log("WARN", f"旧索引已备份到 {bak}")
+            except Exception as e:
+                log("ERROR", f"索引备份失败（继续重建，但台账不可恢复）: {e!r}")
         if stale:
             self.conn.execute("DROP TABLE IF EXISTS hashes")
             self.conn.execute("DROP TABLE IF EXISTS duplicates")
