@@ -90,6 +90,73 @@ async def call(ws, action: str, params: dict | None = None, timeout: float = 8.0
             return d
 
 
+ALERT_STATE = STATE_DIR / "alert_state.json"
+
+
+def _load_alert_state() -> dict:
+    try:
+        import json as _j
+        return _j.loads(ALERT_STATE.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+def _save_alert_state(st: dict) -> None:
+    try:
+        import json as _j
+        tmp = ALERT_STATE.with_suffix(".tmp")
+        tmp.write_text(_j.dumps(st, ensure_ascii=False, indent=2), encoding="utf-8")
+        tmp.replace(ALERT_STATE)
+    except Exception as e:
+        print(f"[warn] 写告警状态失败: {e!r}")
+
+
+def decide_alert(snap: dict, st: dict, now: float,
+                 min_consecutive: int = 3, daily_cap: int = 2) -> tuple[dict | None, dict]:
+    """纯函数：决定是否推送。返回 (消息或 None, 新的状态)。
+
+    省额度策略（Server酱 免费版每天仅 5 条）：
+      1. 掉线需连续 min_consecutive 次探测（约 6 分钟）才推，避免抖动误报
+      2. 同一次故障只推一次，恢复时若推过才推"已恢复"
+      3. 每天最多推 daily_cap 条，超出只写日志不推送
+    """
+    st = dict(st)
+    day = time.strftime("%Y-%m-%d", time.localtime(now))
+    if st.get("day") != day:
+        st = {"day": day, "alerts": 0}
+    st.setdefault("alerts", 0)
+    st.setdefault("down_streak", 0)
+    st.setdefault("alerted_down", False)
+
+    down_now = snap["verdict"] != "ok"
+    if down_now:
+        st["down_streak"] = st.get("down_streak", 0) + 1
+    else:
+        was_alerted = st.get("alerted_down", False)
+        st["down_streak"] = 0
+        if was_alerted:
+            st["alerted_down"] = False
+            if st["alerts"] < daily_cap:
+                st["alerts"] += 1
+                return ({"kind": "recover",
+                         "title": "🟢 QQ 已恢复在线"}, st)
+            return ({"kind": "recover_suppressed",
+                     "title": "QQ 已恢复，但今日推送额度已用完（不推送）"}, st)
+        return (None, st)
+
+    # 掉线中
+    if st.get("alerted_down"):
+        return (None, st)                      # 本次故障已告警过
+    if st["down_streak"] < min_consecutive:
+        return (None, st)                      # 还没到去抖阈值
+    if st["alerts"] >= daily_cap:
+        return ({"kind": "down_suppressed",
+                 "title": f"持续掉线（{snap['verdict']}），但今日额度已用完（不推送）"}, st)
+    st["alerted_down"] = True
+    st["alerts"] += 1
+    return ({"kind": "down", "title": f"🔴 QQ 掉线：{snap['verdict']}"}, st)
+
+
 def last_image_ts() -> tuple[str | None, float | None]:
     """最近一张落盘图片（路径, mtime），用于判断'在线但没动静'。"""
     newest_p, newest_t = None, None
@@ -184,38 +251,45 @@ def write(snap: dict) -> None:
             f.write(line + "\n")
         print(f"[state] {line}")
 
-        # 状态翻转才推送，避免每 2 分钟骚扰
-        prev_ok = prev_verdict in (None, "ok")   # 首次运行不告警
-        down_now = snap["verdict"] != "ok"
-        if prev_ok and down_now:
-            title = f"🔴 QQ 掉线：{snap['verdict']}"
-        elif (not prev_ok) and not down_now:
-            title = "🟢 QQ 已恢复在线"
+        # 推送决策交给 decide_alert：去抖 + 单次故障只推一次 + 每日额度上限
+        st = _load_alert_state()
+        msg, st2 = decide_alert(snap, st, time.time(),
+                                min_consecutive=int(os.environ.get("GIS_ALERT_MIN_CONSECUTIVE", "3")),
+                                daily_cap=int(os.environ.get("GIS_ALERT_DAILY_CAP", "2")))
+        if msg is None:
+            _save_alert_state(st2)
         else:
-            title = f"⚠️ 状态变化：{prev_verdict or '-'} → {snap['verdict']}"
-
-        desp_lines = [
-            f"**判定**：{snap['verdict']}",
-            f"**时间**：{snap['ts_text']}",
-            f"**online/good**：{snap['online']} / {snap['good']}",
-            f"**账号**：{snap['user_id']} ({snap['nickname']})",
-        ]
-        lim = snap.get("last_image_age_min")
-        if lim is not None:
-            desp_lines.append(f"**最近一张图**：{lim:.1f} 分钟前")
-        if snap.get("error"):
-            desp_lines.append(f"**错误**：`{snap['error'][:300]}`")
-        if down_now:
-            desp_lines.append("")
-            desp_lines.append("**处理建议**：")
-            if snap["verdict"] == "ws_down":
-                desp_lines.append("- 检查 NapCat：`systemctl status napcat`，必要时重启")
-            elif snap["verdict"] == "offline":
-                desp_lines.append("- QQ 需重新登录（NapCat WebUI / 扫码）")
+            kind = msg["kind"]
+            if kind.endswith("suppressed"):
+                print(f"[alert] 抑制推送：{msg['title']}")
+                _save_alert_state(st2)
             else:
-                desp_lines.append("- 观察，若持续 >10 分钟按上面两类排查")
-        ok, info = send_alert(title, "\n\n".join(desp_lines))
-        print(f"[alert] {'已推送' if ok else '推送失败'} | {title} | {info[:160]}")
+                desp_lines = [
+                    f"**判定**：{snap['verdict']}",
+                    f"**时间**：{snap['ts_text']}",
+                    f"**online/good**：{snap['online']} / {snap['good']}",
+                    f"**账号**：{snap['user_id']} ({snap['nickname']})",
+                ]
+                lim = snap.get("last_image_age_min")
+                if lim is not None:
+                    desp_lines.append(f"**最近一张图**：{lim:.1f} 分钟前")
+                if snap.get("error"):
+                    desp_lines.append(f"**错误**：`{snap['error'][:300]}`")
+                if kind == "down":
+                    desp_lines += ["", "**处理建议**："]
+                    if snap["verdict"] == "ws_down":
+                        desp_lines.append("- 检查 NapCat：`systemctl status napcat`，必要时重启")
+                    elif snap["verdict"] == "offline":
+                        desp_lines.append("- QQ 需重新登录（NapCat WebUI / 扫码）")
+                    else:
+                        desp_lines.append("- 观察，若持续 >10 分钟按上面两类排查")
+                desp_lines.append("")
+                desp_lines.append(f"_今日已用推送 {st2.get('alerts')} / 上限 {st2.get('daily_cap', 2)}_")
+                body = "\n\n".join(desp_lines)
+                ok, info = send_alert(msg["title"], body)
+                print(f"[alert] {'已推送' if ok else '推送失败'} | {msg['title']} | {info[:160]}")
+                if ok:
+                    _save_alert_state(st2)
 
 
 def main() -> int:
