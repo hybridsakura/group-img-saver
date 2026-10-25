@@ -37,6 +37,44 @@ STATE_DIR = Path(os.environ.get("GIS_HEALTH_DIR", "/opt/group_img_saver"))
 SNAPSHOT = STATE_DIR / "health.json"
 HISTORY = STATE_DIR / "health.log"
 IMAGES_ROOT = Path(os.environ.get("GIS_IMAGES_ROOT", "/root/group_imgs"))
+# Server酱 SendKey：优先环境变量，其次 STATE_DIR/.sc_key（建议 chmod 600）。
+# 不要把 key 写进代码或提交到仓库。
+SC_KEY_FILE = STATE_DIR / ".sc_key"
+SC_API = "https://sctapi.ftqq.com/{key}.send"
+_ALERT_DISABLED = False
+
+
+def sc_key() -> str | None:
+    k = (os.environ.get("GIS_SC_KEY") or "").strip()
+    if k:
+        return k
+    if SC_KEY_FILE.exists():
+        try:
+            return SC_KEY_FILE.read_text(encoding="utf-8").strip() or None
+        except Exception:
+            return None
+    return None
+
+
+def send_alert(title: str, desp: str, key: str | None = None) -> tuple[bool, str]:
+    """通过 Server酱 推送告警。返回 (是否成功, 说明)。"""
+    if _ALERT_DISABLED:
+        return (False, "已通过 --no-alert 禁用推送")
+    key = key or sc_key()
+    if not key:
+        return (False, "未配置 Server酱 key（GIS_SC_KEY 或 .sc_key）")
+    try:
+        import urllib.parse
+        import urllib.request
+        data = urllib.parse.urlencode({"title": title[:100], "desp": desp[:30000]}).encode()
+        req = urllib.request.Request(SC_API.format(key=key), data=data,
+                                     headers={"Content-Type": "application/x-www-form-urlencoded"})
+        with urllib.request.urlopen(req, timeout=15) as r:
+            body = r.read().decode("utf-8", "replace")
+        ok = r.status == 200 and '"code":0' in body.replace(" ", "")
+        return (ok, body[:300])
+    except Exception as e:
+        return (False, f"发送异常: {e!r}")
 
 
 async def call(ws, action: str, params: dict | None = None, timeout: float = 8.0):
@@ -146,8 +184,58 @@ def write(snap: dict) -> None:
             f.write(line + "\n")
         print(f"[state] {line}")
 
+        # 状态翻转才推送，避免每 2 分钟骚扰
+        prev_ok = prev_verdict in (None, "ok")   # 首次运行不告警
+        down_now = snap["verdict"] != "ok"
+        if prev_ok and down_now:
+            title = f"🔴 QQ 掉线：{snap['verdict']}"
+        elif (not prev_ok) and not down_now:
+            title = "🟢 QQ 已恢复在线"
+        else:
+            title = f"⚠️ 状态变化：{prev_verdict or '-'} → {snap['verdict']}"
+
+        desp_lines = [
+            f"**判定**：{snap['verdict']}",
+            f"**时间**：{snap['ts_text']}",
+            f"**online/good**：{snap['online']} / {snap['good']}",
+            f"**账号**：{snap['user_id']} ({snap['nickname']})",
+        ]
+        lim = snap.get("last_image_age_min")
+        if lim is not None:
+            desp_lines.append(f"**最近一张图**：{lim:.1f} 分钟前")
+        if snap.get("error"):
+            desp_lines.append(f"**错误**：`{snap['error'][:300]}`")
+        if down_now:
+            desp_lines.append("")
+            desp_lines.append("**处理建议**：")
+            if snap["verdict"] == "ws_down":
+                desp_lines.append("- 检查 NapCat：`systemctl status napcat`，必要时重启")
+            elif snap["verdict"] == "offline":
+                desp_lines.append("- QQ 需重新登录（NapCat WebUI / 扫码）")
+            else:
+                desp_lines.append("- 观察，若持续 >10 分钟按上面两类排查")
+        ok, info = send_alert(title, "\n\n".join(desp_lines))
+        print(f"[alert] {'已推送' if ok else '推送失败'} | {title} | {info[:160]}")
+
 
 def main() -> int:
+    import argparse
+    ap = argparse.ArgumentParser(description="NapCat/QQ 登录状态探测")
+    ap.add_argument("--test-alert", action="store_true", help="发一条测试推送后退出")
+    ap.add_argument("--no-alert", action="store_true", help="只探测，不推送")
+    args = ap.parse_args()
+
+    if args.test_alert:
+        body = ("这是一条来自 y40 的测试消息。\n\n"
+                f"时间：{time.strftime('%Y-%m-%d %H:%M:%S')}")
+        ok, info = send_alert("🧪 测试推送：y40_napcat_login_status", body)
+        print(("OK " if ok else "FAIL ") + info)
+        return 0 if ok else 1
+
+    if args.no_alert:
+        global _ALERT_DISABLED
+        _ALERT_DISABLED = True
+
     snap = asyncio.run(probe())
     write(snap)
     print(json.dumps({k: snap[k] for k in

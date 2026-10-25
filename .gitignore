@@ -9,3 +9,6 @@ images/
 *.db-shm
 *.part
 .DS_Store
+
+# Server酱 SendKey（绝不入库）
+.sc_key
