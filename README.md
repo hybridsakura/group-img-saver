@@ -197,3 +197,34 @@ python test_dedup.py        # 38 项断言，真实 HTTP 下载，非 mock
 ## License
 
 MIT
+
+---
+
+## 附：NapCat 登录状态监测（可选）
+
+`napcat_health.py` 探测 NapCat/QQ 是否还在线，写入 JSON 快照，供外部工具消费。
+
+```bash
+# 一次性探测（退出码：0=健康 1=掉线/异常 2=WS 连不上）
+.venv/bin/python napcat_health.py
+
+# 输出示例
+{"ts_text": "2026-10-26 02:20:03", "ws_ok": true, "online": true, "good": true,
+ "logged_in": true, "user_id": 469803465, "nickname": "プリズム", "verdict": "ok",
+ "last_image_age_min": 6.5, "error": null}
+```
+
+判定来源是 NapCat 的真实接口：`get_status → {online, good}`、`get_login_info → {user_id, nickname}`。
+`verdict` 取值：`ok` / `degraded`（online 但 good=false）/ `offline`（QQ 掉线）/ `no_login_info` / `ws_down`。
+
+配套 systemd 定时器（每 2 分钟）：
+
+```ini
+# napcat-health.service  (Type=oneshot, ExecStart=.venv/bin/python napcat_health.py)
+# napcat-health.timer    (OnBootSec=1min, OnUnitActiveSec=2min)
+systemctl enable --now napcat-health.timer
+```
+
+产物：`health.json`（最新快照）+ `health.log`（仅在状态翻转时追加一行）。
+
+> 注意：QQ 掉线时无法用 QQ 自身发告警，需另接独立通道（邮件 / Telegram / Server酱）。
